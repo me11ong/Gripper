@@ -1,160 +1,139 @@
 import torch
-from mmdet.models import DETECTORS
+from mmdet.registry import MODELS              # 변경점: DETECTORS → MODELS
+                                               # 2.x: mmdet.models.DETECTORS
+                                               # 3.x: mmdet.registry.MODELS
 from mmdet.models.detectors.mask_rcnn import MaskRCNN
+from mmdet.structures import DetDataSample     # 변경점: 3.x 전용 데이터 구조
+from mmdet.utils import OptSampleList
 
 
-@DETECTORS.register_module()
+@MODELS.register_module()
 class CustomMaskRCNN(MaskRCNN):
     """
     Mask R-CNN variant that always takes text input
-    (text affects backbone features only, not losses)
+    (text affects backbone/neck features only, not losses)
     """
 
     def __init__(self, *args, **kwargs):
-        super(CustomMaskRCNN, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
-    # --------------------------------------------------
-    # Feature extraction (text-aware)
-    # --------------------------------------------------
-    def extract_feat(self, img, img_metas):
+
+    def extract_feat(self, batch_inputs: torch.Tensor,
+                     batch_data_samples: OptSampleList = None):
         """
-        img: Tensor (B, C, H, W)
-        img_metas: list[dict], each contains 'texts'
+        batch_inputs      : Tensor (B, C, H, W)
+        batch_data_samples: list[DetDataSample], each contains metainfo['texts']
         """
-        assert img_metas is not None
 
-        texts = [
-            meta['texts'].data if hasattr(meta['texts'], 'data') else meta['texts']
-            for meta in img_metas
-        ]
+        if batch_data_samples is not None:
+            texts = [
+                ds.metainfo['texts']
+                for ds in batch_data_samples
+            ]
+        else:
+            texts = None
 
-        x = self.backbone(img, gt_texts=texts)
+        x = self.backbone(batch_inputs, gt_texts=texts)
 
-        # If using TextGuidedFPN, pass text embeddings to neck
         if self.with_neck:
-            # Check if backbone has text_embeddings attribute (from GreedyViG_CostMatrix)
             if hasattr(self.backbone, 'text_embeddings'):
                 text_embeddings = self.backbone.text_embeddings
-                # Check if neck is TextGuidedFPN
                 if hasattr(self.neck, 'set_text_embeddings'):
                     self.neck.set_text_embeddings(text_embeddings)
             x = self.neck(x)
 
         return x
 
-    def forward_dummy(self, img):
+    def loss(self, batch_inputs: torch.Tensor,
+             batch_data_samples: list) -> dict:
         """
-        Used for computing FLOPs.
+        학습 시 호출. losses dict 반환.
+        변경점: forward_train(img, img_metas, gt_bboxes, ...) → loss(batch_inputs, batch_data_samples)
+        gt_bboxes, gt_labels, gt_masks 등은 batch_data_samples 안에 포함됨.
         """
-
-        batch_size, _, H, W = img.shape
-
-        dummy_img_metas = [{
-            'img_shape': (H, W, 3),
-            'ori_shape': (H, W, 3),
-            'pad_shape': (H, W, 3),
-            'scale_factor': 1.0,
-            'flip': False,
-            'flip_direction': None,
-            'img_norm_cfg': dict(
-                mean=[0, 0, 0],
-                std=[1, 1, 1],
-                to_rgb=True
-            ),
-            'filename': None,
-            'ori_filename': None,
-            'texts': ['red organic apple']
-        } for _ in range(batch_size)]
-
-        x = self.extract_feat(img, dummy_img_metas)
-
-        outs = ()
-
-        if self.with_rpn:
-            rpn_outs = self.rpn_head(x)
-            outs = outs + (rpn_outs,)
-
-        if self.with_rpn:
-            rpn_outs = self.rpn_head(x)
-
-            proposal_list = self.rpn_head.get_bboxes(
-                *rpn_outs,
-                img_metas=dummy_img_metas,
-                cfg=self.test_cfg.rpn
-            )
-
-        else:
-            proposal_list = [torch.randn(1000, 4).to(img.device)
-                            for _ in range(batch_size)]
-            roi_outs = self.roi_head.forward_dummy(x, proposal_list)
-            outs = outs + (roi_outs,)
-
-        return outs
-
-
-    def forward_train(self,
-                      img,
-                      img_metas,
-                      gt_bboxes,
-                      gt_labels,
-                      gt_masks,
-                      gt_bboxes_ignore=None,
-                      proposals=None,
-                      **kwargs):
-        """
-        text is implicitly passed through img_metas
-        """
-        x = self.extract_feat(img, img_metas)
+        x = self.extract_feat(batch_inputs, batch_data_samples)
 
         losses = dict()
 
-
-        # RPN forward and loss
+        # RPN
         if self.with_rpn:
-            proposal_cfg = self.train_cfg.get('rpn_proposal',
-                                              self.test_cfg.rpn)
-            rpn_losses, proposal_list = self.rpn_head.forward_train(
+            proposal_cfg = self.train_cfg.get('rpn_proposal', self.test_cfg.rpn)
+            rpn_data_samples = batch_data_samples
+            rpn_losses, rpn_results_list = self.rpn_head.loss_and_predict(
                 x,
-                img_metas,
-                gt_bboxes,
-                gt_labels=None,
-                gt_bboxes_ignore=gt_bboxes_ignore,
+                rpn_data_samples,
                 proposal_cfg=proposal_cfg,
-                **kwargs)
+            )
             losses.update(rpn_losses)
         else:
-            proposal_list = proposals
+            assert batch_data_samples[0].get('proposals', None) is not None
+            rpn_results_list = [
+                ds.proposals for ds in batch_data_samples
+            ]
 
-        roi_losses = self.roi_head.forward_train(x, img_metas, proposal_list,
-                                                 gt_bboxes, gt_labels,
-                                                 gt_bboxes_ignore, gt_masks,
-                                                 **kwargs)
+        # ROI
+        roi_losses = self.roi_head.loss(
+            x, rpn_results_list, batch_data_samples
+        )
         losses.update(roi_losses)
 
         return losses
-    # --------------------------------------------------
-    # Inference
-    # --------------------------------------------------
-    def simple_test(self, imgs, img_metas, proposals=None, rescale=False):
-        """
-        text is always used in extract_feat
-        """
-        x = self.extract_feat(imgs, img_metas)
 
-        if proposals is None:
-            proposal_list = self.rpn_head.simple_test_rpn(
-                x, img_metas
-            )
+    def predict(self, batch_inputs: torch.Tensor,
+                batch_data_samples: list,
+                rescale: bool = True) -> list:
+        """
+        추론 시 호출. list[DetDataSample] 반환.
+        변경점: simple_test(imgs, img_metas, ...) → predict(batch_inputs, batch_data_samples)
+        """
+        x = self.extract_feat(batch_inputs, batch_data_samples)
+
+        if batch_data_samples[0].get('proposals', None) is None:
+            rpn_results_list = self.rpn_head.predict(x, batch_data_samples,
+                                                     rescale=False)
         else:
-            proposal_list = proposals
+            rpn_results_list = [
+                ds.proposals for ds in batch_data_samples
+            ]
 
-        return self.roi_head.simple_test(
-            x,
-            proposal_list,
-            img_metas,
-            rescale=rescale
+        results = self.roi_head.predict(
+            x, rpn_results_list, batch_data_samples, rescale=rescale
         )
-  
+        return results
 
-    
+    def _forward(self, batch_inputs: torch.Tensor,
+                 batch_data_samples: OptSampleList = None):
+        """
+        FLOPs 계산 등 dummy forward 용도.
+        변경점: forward_dummy → _forward
+        """
+        B, _, H, W = batch_inputs.shape
 
+        if batch_data_samples is None:
+            # dummy data_samples 생성
+            from mmdet.structures import DetDataSample
+            from mmengine.structures import InstanceData
+            dummy_samples = []
+            for _ in range(B):
+                ds = DetDataSample()
+                ds.set_metainfo(dict(
+                    img_shape=(H, W),
+                    ori_shape=(H, W),
+                    pad_shape=(H, W),
+                    scale_factor=(1.0, 1.0),
+                    flip=False,
+                    flip_direction=None,
+                    img_path=None,
+                    texts=['red organic apple'],
+                ))
+                dummy_samples.append(ds)
+            batch_data_samples = dummy_samples
+
+        x = self.extract_feat(batch_inputs, batch_data_samples)
+        outs = ()
+
+        if self.with_rpn:
+            rpn_outs = self.rpn_head.forward(x)
+            outs = outs + (rpn_outs,)
+
+        return outs

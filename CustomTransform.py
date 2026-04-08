@@ -1,17 +1,23 @@
-from mmdet.datasets.builder import PIPELINES
-from mmcv.parallel import DataContainer as DC
+from mmdet.registry import TRANSFORMS         
+                                               
+                                               
 
-@PIPELINES.register_module()
 
+@TRANSFORMS.register_module()
 class LoadTextAnnotations:
+
+
     def __init__(self):
         pass
 
-    def __call__(self, results):
-        texts = results['ann_info']['texts']
+    def __call__(self, results: dict) -> dict:
+        texts = results.get('texts', None)
 
-        results['texts'] = DC(texts, cpu_only=True)
+        if texts is None:
+            
+            ann_info = results.get('ann_info', {})
+            texts = ann_info.get('texts', [])
+
+        results['texts'] = texts
 
         return results
-
-
